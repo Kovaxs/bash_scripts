@@ -1,0 +1,39 @@
+#!/bin/bash
+
+# Name of the tmux session
+SESSION_NAME="monitoring"
+
+# Function to check if a command exists
+command_exists() {
+  command -v "$1" &>/dev/null
+}
+
+# Ensure required commands are installed
+if ! command_exists htop; then
+  echo "Error: 'htop' is not installed. Please install it and try again."
+  exit 1
+fi
+
+if ! command_exists nvtop; then
+  echo "Error: 'nvtop' is not installed. Please install it and try again."
+  exit 1
+fi
+
+# Check if the session already exists
+tmux has-session -t $SESSION_NAME 2>/dev/null
+
+if [ $? != 0 ]; then
+  # Create a new session and run htop in the first pane
+  tmux new-session -d -s $SESSION_NAME -n monitor 'htop'
+
+  # Split the window vertically and run nvtop in the second pane
+  tmux split-window -v -t $SESSION_NAME:1 'nvtop'
+fi
+
+# If already inside a tmux session, switch to the new session
+if [ -n "$TMUX" ]; then
+  tmux switch-client -t $SESSION_NAME
+else
+  # If not in a tmux session, attach to the new session
+  tmux attach -t $SESSION_NAME
+fi

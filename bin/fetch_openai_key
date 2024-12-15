@@ -1,0 +1,22 @@
+#!/bin/bash
+
+# Decrypt the Bitwarden API key using OpenSSL and the SSH private key
+# BW_API_KEY=$(openssl pkeyutl -decrypt -inkey ~/.ssh/id_rsa_pem -in ~/.ssh/bw_api_key.enc)
+# BW_CLIENT_ID=$(openssl pkeyutl -decrypt -inkey ~/.ssh/id_rsa_pem -in ~/.ssh/bw_client_id.enc)
+OPENAI_API_KEY=$(openssl pkeyutl -decrypt -inkey ~/.ssh/id_rsa_pem -in ~/.ssh/openai_api_key.enc)
+echo $OPENAI_API_KEY
+ 
+
+# export BW_CLIENTSECRET=$BW_API_KEY
+# export BW_CLIENTID=$BW_CLIENT_ID
+
+# Log in to Bitwarden using the API key and capture the session key
+# bw login --apikey
+
+# BW_SESSION=$(bw unlock)
+# export BW_SESSION=$(bw login --apikey --clientid $BW_CLIENT_ID --clientsecret $BW_CLIENT_SECRET --raw)
+# echo $BW_SESSION
+# Fetch the OpenAI API key from Bitwarden
+# OPENAI_API_KEY=$(BW_SESSION=$BW_SESSION bw get item OpenAI | jq -r '.fields[] | select(.name=="API Key").value')
+# bw get item "05b7b983-e255-4167-8509-b1bc01029c68"
+# Output the OpenAI API key

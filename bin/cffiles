@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+
+copy_filtered_files() {
+    local fdirs=()  # Array to hold directories to exclude
+    local ffile=""
+    # Parse arguments
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            --fdir) 
+                shift
+                while [[ "$#" -gt 0 && "$1" != --* ]]; do
+                    fdirs+=("$1")  # Add each directory to the array
+                    shift
+                done
+                ;;
+            --ffile) 
+                ffile="$2"
+                shift
+                ;;
+            *) 
+                echo "Unknown parameter passed: $1"
+                return 1
+                ;;
+        esac
+        shift
+    done
+    # Check if both arguments are provided
+    if [[ ${#fdirs[@]} -eq 0 || -z "$ffile" ]]; then
+        echo "Usage: copy_filtered_files --fdir <dir1> <dir2> ... --ffile <file_pattern>"
+        return 1
+    fi
+    # Create the destination directory
+    local dest_dir="./filtered_ktmon"
+    mkdir -p "$dest_dir"
+    # Build the find command to exclude directories
+    local prune_cmd=""
+    for dir in "${fdirs[@]}"; do
+        prune_cmd+=" -name '$dir' -o"
+    done
+    # Remove the last ' -o' from the command
+    prune_cmd=${prune_cmd::-3}
+    # Find and copy the files
+    eval "find . -type d \( $prune_cmd \) -prune -o -name '$ffile' -print" | while read -r file; do
+        # Create the directory structure in the destination
+        mkdir -p "$dest_dir/$(dirname "$file")"
+        # Copy the file
+        cp "$file" "$dest_dir/$file"
+    done
+    echo "Files copied to $dest_dir"
+}
+
