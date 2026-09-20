@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Keep the user's PATH, with fallbacks for macOS Homebrew and Nix installs.
+export PATH="${PATH:-/usr/bin:/bin}:/opt/homebrew/bin:/usr/local/bin:/run/current-system/sw/bin"
+
+for command_name in pass fzf; do
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    printf 'Required command not found: %s\n' "$command_name" >&2
+    exit 1
+  fi
+done
+
+store="${PASSWORD_STORE_DIR:-$HOME/.password-store}"
+if [[ ! -d "$store" ]]; then
+  printf 'Password store not found: %s\n' "$store" >&2
+  exit 1
+fi
+
+# Search names only. NUL delimiters preserve spaces and other special characters.
+# Escape or Ctrl-C leaves the clipboard untouched.
+if ! IFS= read -r -d '' selected < <(
+  cd "$store" || exit 1
+  find . -type f -name '*.gpg' -print0 |
+    while IFS= read -r -d '' entry; do
+      entry="${entry#./}"
+      printf '%s\0' "${entry%.gpg}"
+    done |
+    fzf --read0 --print0 --no-multi --height=70% --layout=reverse \
+      --border --prompt='Password > ' --query="${1:-}" \
+      --header='Enter: copy password | Esc: cancel'
+); then
+  exit 0
+fi
+
+# Prefix with ./ so an entry name cannot be interpreted as a pass option.
+pass show --clip "./$selected"
