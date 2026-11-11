@@ -455,7 +455,10 @@ case ${1:-} in
     *)
         # Original tmux-sessionizer behavior: no flags required.
         if [[ $# -eq 1 ]]; then
-            selected=$1
+            # Normalize to an absolute path without a trailing slash. A trailing slash
+            # (e.g. from tab completion) leaves bash's \W prompt escape empty.
+            selected=$(cd -- "${1/#\~/$HOME}" 2> /dev/null && pwd) || \
+                die "not a directory: $1"
         else
             selected=$(find ~/workspace -mindepth 1 -maxdepth 1 -type d | fzf)
         fi
