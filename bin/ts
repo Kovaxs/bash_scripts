@@ -1,31 +1,470 @@
 #!/usr/bin/env bash
 
-# ThePrimegen tmux script
+# ThePrimegen tmux script, with optional jj workspace modes.
 
-if [[ $# -eq 1 ]]; then
-    selected=$1
-else
-    selected=$(find ~/workspace -mindepth 1 -maxdepth 1 -type d | fzf)
-fi
+usage() {
+    cat <<'EOF'
+ts - tmux sessionizer and jj workspaces for parallel pi agents
 
-if [[ -z $selected ]]; then
-    exit 0
-fi
+USAGE
+  ts                         Choose a directory with fzf (original behavior)
+  ts <directory>             Open/switch to a tmux session for a directory
 
-selected_name=$(basename "$selected" | tr . _)
-tmux_running=$(pgrep tmux)
+  ts --session <workspace> [--from <revision>]
+  ts --window  <workspace> [--from <revision>]
+  ts --merge   <workspace> --into <local-bookmark>
+  ts --push    <workspace> [--branch <bookmark>] [--remote <remote>]
+  ts --close   <workspace>
+  ts --help
 
-if [[ -z $TMUX ]] && [[ -z $tmux_running ]]; then
-    tmux new-session -s $selected_name -c $selected
-    exit 0
-fi
+WORKSPACE MODEL
+  A workspace is a jj working copy in <repo>.worktrees/<workspace>.
+  A workspace is NOT automatically a bookmark/Git branch.
+  --push creates/updates its published bookmark; --merge moves the explicit
+  destination bookmark. Bookmarks can also be managed directly with jj.
+  Workspace names use letters, digits, '_' and '-'. When creating one,
+  '/', '.', and ':' in the supplied name become '_'.
 
-if ! tmux has-session -t="$selected_name" 2> /dev/null; then
-    tmux new-session -ds "$selected_name" -c "$selected"
-fi
+COMMANDS
+  --session  Create a workspace from trunk() and start pi in a new tmux
+             session. New windows inherit the active pane's directory.
+  --window   Create a workspace and start pi in a named window in the
+             current tmux session. Must be run from inside tmux.
+  --from     Base the new workspace on an existing local bookmark, remote
+             bookmark, or revision instead of trunk(). If NAME has no local
+             bookmark, NAME@origin is tried before failing.
 
-if [[ -n $TMUX ]]; then
-    tmux switch-client -t "$selected_name"
-else
-    tmux attach-session -t "$selected_name"
-fi
+  --merge    Rebase WORKSPACE@ onto the required local --into bookmark,
+             then move that bookmark to the rebased workspace change.
+             No feature bookmark is needed. Conflicts leave the destination
+             unchanged. Does not fetch, push, or close the workspace.
+
+  --push     Set a local bookmark to WORKSPACE@ and push it as a Git branch.
+             Defaults: bookmark = workspace name, remote = origin.
+             Use --branch when the published name differs from the workspace.
+             Does not merge or close the workspace.
+
+  --close    Interactively close a workspace. Shows its status and tmux
+             target, then requires typing the exact workspace name.
+             Forgets the jj workspace and deletes its directory.
+             Bookmarks and remote branches are never deleted.
+
+RECIPES
+  New local work in a session:
+    ts --session feat-ui
+    # Work with pi, then inside the workspace:
+    jj describe -m "feat: add UI"
+    # From any directory in the repository:
+    ts --merge feat-ui --into main
+    jj git push --bookmark main
+    ts --close feat-ui
+
+  New local work in a window of the current session:
+    ts --window feat-ui
+    # New panes stay in the active workspace directory.
+
+  Open an existing local or origin branch:
+    ts --session feat-ui --from feat-ui
+    ts --window feat-ui --from feat-ui@origin
+
+  Publish a workspace as a remote branch and open a PR:
+    jj describe -m "feat: add UI"
+    ts --push feat-ui
+    gh pr create --base main --head feat-ui --fill
+    # After the PR is merged:
+    jj git fetch
+    ts --close feat-ui
+
+  Publish using a branch name different from the workspace:
+    ts --push feat_ui --branch feature/ui --remote origin
+
+INSPECTION
+  jj workspace list           List all workspaces in the current repository
+  jj status                   Show the current workspace change
+  jj diff                     Show its uncommitted/working-copy diff
+  jj log -r 'working_copies()' Show changes belonging to all workspaces
+
+SAFETY
+  Run workspace commands inside a jj repository. Plain ts needs no jj repo.
+  Merge never moves the destination bookmark when rebase has conflicts.
+  Close always prompts and never deletes bookmarks or remote branches.
+  Do not close a workspace before merging or publishing its unique work.
+EOF
+}
+
+die() {
+    printf 'ts: %s\n' "$*" >&2
+    exit 1
+}
+
+usage_error() {
+    printf 'ts: %s\n\n' "$*" >&2
+    usage >&2
+    exit 2
+}
+
+require_repo() {
+    command -v jj > /dev/null || die "required command not found: jj"
+    repo_root=$(jj root 2> /dev/null) || die "this command must be run inside a jj repository"
+}
+
+validate_workspace() {
+    local workspace=$1
+    [[ $workspace =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || \
+        die "invalid workspace '$workspace'; use letters, digits, '_' and '-'"
+}
+
+workspace_dir() {
+    printf '%s.worktrees/%s\n' "$repo_root" "$1"
+}
+
+revision_exists() {
+    local revision
+    revision=$(jj log --no-graph --limit 1 -r "$1" -T 'commit_id' 2> /dev/null) || return 1
+    [[ -n $revision ]]
+}
+
+require_workspace() {
+    local workspace=$1
+    validate_workspace "$workspace"
+    [[ $workspace != default ]] || die "the default workspace is not managed by ts"
+    revision_exists "${workspace}@" || die "jj workspace not found: $workspace"
+    local directory
+    directory=$(workspace_dir "$workspace")
+    [[ -d $directory ]] || die "workspace directory not found: $directory"
+}
+
+local_bookmark_exists() {
+    local bookmark=$1
+    jj bookmark list "$bookmark" -T 'if(remote, "", name ++ "\n")' 2> /dev/null | \
+        grep -Fxq -- "$bookmark"
+}
+
+open_session() {
+    local selected=$1
+    local selected_name=$2
+    shift 2
+
+    local tmux_running
+    tmux_running=$(pgrep tmux)
+
+    if [[ -z $TMUX ]] && [[ -z $tmux_running ]]; then
+        tmux new-session -s "$selected_name" -c "$selected" "$@"
+        exit 0
+    fi
+
+    if ! tmux has-session -t="$selected_name" 2> /dev/null; then
+        tmux new-session -ds "$selected_name" -c "$selected" "$@"
+    fi
+
+    if [[ -n $TMUX ]]; then
+        tmux switch-client -t "$selected_name"
+    else
+        tmux attach-session -t "$selected_name"
+    fi
+}
+
+create_workspace() {
+    local mode=$1
+    shift
+    local workspace=''
+    local from=''
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --from)
+                [[ $# -ge 2 && -n $2 ]] || usage_error "--from requires a revision or bookmark"
+                from=$2
+                shift 2
+                ;;
+            -*)
+                usage_error "unknown option for $mode: $1"
+                ;;
+            *)
+                [[ -z $workspace ]] || usage_error "$mode accepts exactly one workspace name"
+                workspace=$1
+                shift
+                ;;
+        esac
+    done
+
+    [[ -n $workspace ]] || usage_error "$mode requires a workspace name"
+    command -v pi > /dev/null || die "required command not found: pi"
+    command -v tmux > /dev/null || die "required command not found: tmux"
+    require_repo
+
+    # Preserve the original convenience: branch-like names become safe,
+    # deterministic workspace and tmux names.
+    workspace=$(printf '%s' "$workspace" | tr '/.:' '___')
+    validate_workspace "$workspace"
+
+    if [[ $mode == --window && -z ${TMUX:-} ]]; then
+        die "--window must be run from inside a tmux session"
+    fi
+
+    local selected
+    selected=$(workspace_dir "$workspace")
+    [[ ! -e $selected ]] || die "workspace path already exists: $selected"
+
+    if [[ $mode == --session ]] && tmux has-session -t="$workspace" 2> /dev/null; then
+        die "tmux session already exists: $workspace"
+    fi
+
+    local base_revision='trunk()'
+    if [[ -n $from ]]; then
+        if revision_exists "$from"; then
+            base_revision=$from
+        elif [[ $from != *@* ]] && revision_exists "${from}@origin"; then
+            base_revision="${from}@origin"
+            printf "ts: using remote bookmark %s\n" "$base_revision"
+        else
+            die "base revision not found: $from (try 'jj git fetch' or an explicit NAME@origin)"
+        fi
+    elif ! revision_exists "$base_revision"; then
+        die "cannot resolve trunk(); use --from to choose a base revision"
+    fi
+
+    printf 'ts: creating workspace %s from %s\n' "$workspace" "$base_revision"
+    mkdir -p "$(dirname "$selected")"
+    if ! jj workspace add --name "$workspace" --revision "$base_revision" "$selected"; then
+        die "failed to create jj workspace: $workspace"
+    fi
+
+    if [[ $mode == --session ]]; then
+        open_session "$selected" "$workspace" pi
+    else
+        tmux new-window -n "$workspace" -c "$selected" pi \; \
+            set-window-option automatic-rename off
+    fi
+}
+
+merge_workspace() {
+    local workspace=''
+    local destination=''
+    shift
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --into)
+                [[ $# -ge 2 && -n $2 ]] || usage_error "--into requires a local bookmark"
+                destination=$2
+                shift 2
+                ;;
+            -*)
+                usage_error "unknown option for --merge: $1"
+                ;;
+            *)
+                [[ -z $workspace ]] || usage_error "--merge accepts exactly one workspace name"
+                workspace=$1
+                shift
+                ;;
+        esac
+    done
+
+    [[ -n $workspace ]] || usage_error "--merge requires a workspace name"
+    [[ -n $destination ]] || usage_error "--merge requires an explicit destination: --into <local-bookmark>"
+    require_repo
+    require_workspace "$workspace"
+    local_bookmark_exists "$destination" || \
+        die "destination is not an existing local bookmark: $destination"
+
+    local directory
+    directory=$(workspace_dir "$workspace")
+    jj -R "$directory" status > /dev/null || die "could not snapshot workspace: $workspace"
+
+    printf 'Source workspace: %s\n' "$workspace"
+    printf 'Source change:    %s@\n' "$workspace"
+    printf 'Destination:      local bookmark %s\n' "$destination"
+    printf 'Action:           rebase onto %s, then move %s\n\n' "$destination" "$destination"
+    jj log --no-graph -r "(${destination})..(${workspace}@)" \
+        -T 'change_id.shortest() ++ " " ++ description.first_line() ++ "\n"'
+
+    local changes
+    changes=$(jj diff --summary --from "$destination" --to "${workspace}@") || \
+        die "could not compare workspace with $destination"
+    [[ -n $changes ]] || die "workspace has no changes relative to $destination"
+    printf '\nChanges to merge:\n%s\n\n' "$changes"
+
+    if ! jj rebase -b "${workspace}@" -d "$destination"; then
+        die "rebase failed; resolve conflicts and retry (destination was not moved)"
+    fi
+    # Rebasing from another workspace can leave this working copy stale.
+    jj -R "$directory" workspace update-stale > /dev/null 2>&1 || \
+        die "rebased, but could not update the stale working copy: $directory"
+    local conflicts
+    conflicts=$(jj log --no-graph -r "(${destination})..(${workspace}@)" \
+        -T 'if(conflict, change_id.shortest() ++ "\n", "")')
+    if [[ -n $conflicts ]]; then
+        die "rebase produced conflicts; resolve them and retry (destination was not moved)"
+    fi
+    if ! jj bookmark set "$destination" -r "${workspace}@"; then
+        die "could not move $destination; workspace was rebased but not closed"
+    fi
+
+    printf '\nMerged %s into %s.\n' "$workspace" "$destination"
+    printf 'Push bookmark: jj git push --bookmark %s\n' "$destination"
+    printf 'Clean up:  ts --close %s\n' "$workspace"
+}
+
+push_workspace() {
+    local workspace=''
+    local bookmark=''
+    local remote='origin'
+    shift
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --branch)
+                [[ $# -ge 2 && -n $2 ]] || usage_error "--branch requires a bookmark name"
+                bookmark=$2
+                shift 2
+                ;;
+            --remote)
+                [[ $# -ge 2 && -n $2 ]] || usage_error "--remote requires a remote name"
+                remote=$2
+                shift 2
+                ;;
+            -*)
+                usage_error "unknown option for --push: $1"
+                ;;
+            *)
+                [[ -z $workspace ]] || usage_error "--push accepts exactly one workspace name"
+                workspace=$1
+                shift
+                ;;
+        esac
+    done
+
+    [[ -n $workspace ]] || usage_error "--push requires a workspace name"
+    require_repo
+    require_workspace "$workspace"
+    bookmark=${bookmark:-$workspace}
+
+    local directory
+    directory=$(workspace_dir "$workspace")
+    jj -R "$directory" status > /dev/null || die "could not snapshot workspace: $workspace"
+
+    printf 'Workspace: %s\n' "$workspace"
+    printf 'Change:    %s@\n' "$workspace"
+    printf 'Bookmark:  %s\n' "$bookmark"
+    printf 'Remote:    %s\n' "$remote"
+
+    jj bookmark set "$bookmark" -r "${workspace}@" || \
+        die "could not set bookmark $bookmark to ${workspace}@"
+    jj git push --remote "$remote" --bookmark "$bookmark" || \
+        die "push failed; local bookmark $bookmark was still updated"
+    printf 'Pushed %s to %s/%s.\n' "$workspace" "$remote" "$bookmark"
+}
+
+close_workspace() {
+    local workspace=${2:-}
+    [[ $# -eq 2 && -n $workspace ]] || usage_error "--close requires exactly one workspace name"
+    require_repo
+    require_workspace "$workspace"
+
+    local directory
+    directory=$(workspace_dir "$workspace")
+
+    printf 'Close workspace: %s\n' "$workspace"
+    printf 'Path:            %s\n\n' "$directory"
+    printf 'Workspace status:\n'
+    jj -R "$directory" status || die "could not snapshot workspace: $workspace"
+
+    local referenced
+    referenced=$(jj log --no-graph -r "(${workspace}@) & ::bookmarks()" -T 'commit_id' 2> /dev/null)
+    if [[ -z $referenced ]]; then
+        printf '\nWARNING: %s@ is not contained in any local bookmark.\n' "$workspace"
+        printf 'It may be unmerged or unpublished. Unique work could become hard to find.\n'
+    fi
+
+    local -a targets=()
+    local session_target=''
+    local target
+    if command -v tmux > /dev/null; then
+        if tmux has-session -t "=$workspace" 2> /dev/null; then
+            session_target=$workspace
+            targets=("session:$workspace")
+        fi
+
+        local window_target
+        while IFS= read -r window_target; do
+            [[ ${window_target#*:} == "$workspace" ]] || continue
+            # A matching session already owns all of its windows.
+            [[ $window_target == "$session_target":* ]] && continue
+            targets+=("window:$window_target")
+        done < <(tmux list-windows -a -F '#{session_name}:#{window_name}' 2> /dev/null)
+    fi
+
+    if [[ ${#targets[@]} -gt 1 ]]; then
+        printf '\nAmbiguous tmux targets:\n' >&2
+        printf '  %s\n' "${targets[@]}" >&2
+        die "close the extra tmux target manually, then retry"
+    fi
+
+    if [[ ${#targets[@]} -eq 1 ]]; then
+        printf '\ntmux target: %s\n' "${targets[0]}"
+        target=${targets[0]}
+        if [[ -n ${TMUX:-} ]]; then
+            local current
+            current=$(tmux display-message -p '#{session_name}:#{window_name}')
+            if [[ $target == "session:${current%%:*}" || $target == "window:$current" ]]; then
+                die "run --close from outside the tmux session/window being closed"
+            fi
+        fi
+    else
+        printf '\ntmux target: none found\n'
+    fi
+
+    printf '\nThis will forget the jj workspace and permanently delete its directory.\n'
+    printf 'Bookmarks and remote branches will NOT be deleted.\n'
+    printf "Type '%s' to confirm: " "$workspace"
+    local confirmation
+    IFS= read -r confirmation || die "confirmation failed; nothing was closed"
+    [[ $confirmation == "$workspace" ]] || die "confirmation did not match; nothing was closed"
+
+    if [[ $target == session:* ]]; then
+        tmux kill-session -t "=$workspace" || die "could not kill tmux session: $workspace"
+    elif [[ $target == window:* ]]; then
+        tmux kill-window -t "${target#window:}" || die "could not kill tmux window: ${target#window:}"
+    fi
+
+    jj workspace forget "$workspace" || die "could not forget jj workspace: $workspace"
+    rm -rf -- "$directory" || die "workspace was forgotten, but its directory could not be deleted"
+    printf 'Closed workspace %s.\n' "$workspace"
+}
+
+case ${1:-} in
+    --help|-h)
+        usage
+        ;;
+    --session|--window)
+        create_workspace "$@"
+        ;;
+    --merge)
+        merge_workspace "$@"
+        ;;
+    --push)
+        push_workspace "$@"
+        ;;
+    --close)
+        close_workspace "$@"
+        ;;
+    --*)
+        usage_error "unknown option: $1"
+        ;;
+    *)
+        # Original tmux-sessionizer behavior: no flags required.
+        if [[ $# -eq 1 ]]; then
+            selected=$1
+        else
+            selected=$(find ~/workspace -mindepth 1 -maxdepth 1 -type d | fzf)
+        fi
+
+        if [[ -z $selected ]]; then
+            exit 0
+        fi
+
+        selected_name=$(basename "$selected" | tr . _)
+        open_session "$selected" "$selected_name"
+        ;;
+esac
