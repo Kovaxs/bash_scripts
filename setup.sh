@@ -22,3 +22,12 @@ find "$SOURCE_FOLDER" -mindepth 1 -maxdepth 1 -type f | while IFS= read -r file;
 done
 
 echo "All files have been symlinked to $HOME/.local/bin"
+
+# spi needs a tiny Pi extension to report the active session without guessing.
+EXTENSION_SOURCE="$(dirname "$SOURCE_FOLDER")/pi-extensions/spi.js"
+if [ -f "$EXTENSION_SOURCE" ]; then
+  PI_EXTENSIONS="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/extensions"
+  mkdir -p "$PI_EXTENSIONS"
+  ln -sf "$EXTENSION_SOURCE" "$PI_EXTENSIONS/spi.js"
+  echo "Pi extension installed: $PI_EXTENSIONS/spi.js (run /reload in existing instances)"
+fi

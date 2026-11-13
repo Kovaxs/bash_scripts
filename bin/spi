@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# Show running Pi agents and their tmux locations. Compatible with macOS Bash 3.2.
+set -euo pipefail
+
+usage() {
+    printf '%s\n' \
+        'spi - show running Pi agents' \
+        '' \
+        'Usage: spi [--help]' \
+        '' \
+        'Lists PID, tmux session/window/pane, state, Pi session name/ID, and directory.' \
+        'SESSION ID shows the first eight characters of the Pi session ID.' \
+        'Requires: ps, awk, jq, column. Optional: tmux, lsof.' \
+        '' \
+        'Run setup.sh to install the companion Pi extension, then /reload in existing' \
+        'Pi instances. Without it, processes and tmux locations still appear, but' \
+        'session metadata is marked reload-needed rather than guessed.' \
+        '' \
+        'Metadata: ${XDG_CACHE_HOME:-$HOME/.cache}/spi (private, local files).'
+}
+
+if [[ $# -gt 0 ]]; then
+    case $1 in
+        -h|--help) usage; exit 0 ;;
+        *) printf 'spi: unexpected argument: %s\n' "$1" >&2; exit 2 ;;
+    esac
+fi
+for cmd in ps awk jq column; do
+    command -v "$cmd" >/dev/null || { printf 'spi: required command not found: %s\n' "$cmd" >&2; exit 1; }
+done
+
+cache_dir=${XDG_CACHE_HOME:-$HOME/.cache}/spi
+work=$(mktemp -d "${TMPDIR:-/tmp}/spi.XXXXXXXX")
+trap 'rm -rf -- "$work"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# A single process snapshot also lets us follow parents back to a tmux pane.
+LC_ALL=C ps -x -o pid=,ppid=,tty=,lstart=,args= > "$work/ps"
+awk '
+    function base(s) { sub(/^.*\//, "", s); return s }
+    {
+        exe = base($9)
+        if (exe == "pi" || ((exe == "node" || exe == "bun") &&
+            (base($10) == "pi" || $10 ~ /pi-coding-agent\/dist\/cli\.js$/))) print $1
+    }
+' "$work/ps" > "$work/pids"
+
+# Include registered agents even when launched by a custom executable/SDK.
+for file in "$cache_dir"/*.json; do
+    [[ -f $file ]] || continue
+    jq -er 'select(type == "object") | .pid | select(type == "number" and . > 0) | floor' "$file" \
+        >> "$work/pids" 2>/dev/null || true
+done
+sort -nu "$work/pids" -o "$work/pids"
+: > "$work/panes"
+: > "$work/sockets"
+
+if command -v tmux >/dev/null; then
+    # Find the current, default, and other standard per-user tmux servers.
+    [[ -z ${TMUX:-} ]] || printf '%s\n' "${TMUX%,*,*}" >> "$work/sockets"
+    tmux display-message -p '#{socket_path}' >> "$work/sockets" 2>/dev/null || true
+    for socket in "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"/*; do
+        [[ ! -S $socket ]] || printf '%s\n' "$socket" >> "$work/sockets"
+    done
+    for file in "$cache_dir"/*.json; do
+        [[ -f $file ]] || continue
+        jq -er '.tmux_socket | select(type == "string" and length > 0)' "$file" \
+            >> "$work/sockets" 2>/dev/null || true
+    done
+    sort -u "$work/sockets" -o "$work/sockets"
+    format=$(printf '#{session_name}\t#{window_index}:#{window_name}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_current_path}')
+    while IFS= read -r socket; do
+        [[ -S $socket ]] || continue
+        tmux -S "$socket" list-panes -a -F "$format" >> "$work/panes" 2>/dev/null || true
+    done < "$work/sockets"
+    sort -u "$work/panes" -o "$work/panes"
+fi
+
+printf 'PID\tTMUX\tWINDOW\tPANE\tSTATE\tPI SESSION\tSESSION ID\tDIRECTORY\n' > "$work/table"
+missing=0
+count=0
+while IFS= read -r pid; do
+    # Ignore exited processes and stale cache entries (including recycled PIDs).
+    started=$(awk -v p="$pid" '$1 == p { print $4, $5, $6, $7, $8; exit }' "$work/ps")
+    [[ -n $started ]] || continue
+    metadata=''
+    file=$cache_dir/$pid.json
+    if [[ -f $file ]]; then
+        metadata=$(jq -er --arg started "$started" --argjson pid "$pid" '
+            select(.pid == $pid and .started == $started) |
+            def cell: tostring | gsub("[[:cntrl:]]"; " ") | if length == 0 then "-" else . end;
+            [.state // "-", .session_name // "(unnamed)", .session_id // "-", .cwd // "-"] |
+            map(cell) | join("\t")
+        ' "$file" 2>/dev/null) || metadata=''
+    fi
+    if [[ -z $metadata ]]; then
+        # A stale registry file alone must never create a phantom Pi instance.
+        awk -v p="$pid" '
+            function base(s) { sub(/^.*\//, "", s); return s }
+            $1 == p {
+                exe = base($9)
+                if (exe == "pi" || ((exe == "node" || exe == "bun") &&
+                    (base($10) == "pi" || $10 ~ /pi-coding-agent\/dist\/cli\.js$/))) found = 1
+            }
+            END { exit !found }
+        ' "$work/ps" || continue
+        metadata=$(printf 'reload-needed\t-\t-\t-')
+        missing=1
+    fi
+    IFS=$'\t' read -r state name session_id directory <<< "$metadata"
+
+    # Prefer ancestry over TTY: nested/headless agents may share a terminal.
+    pane=$(awk -F '\t' -v pid="$pid" '
+        FILENAME == ARGV[1] {
+            # ps pads its first column, so trim before splitting.
+            line = $0; sub(/^[[:space:]]+/, "", line); split(line, a, /[[:space:]]+/)
+            parent[a[1]] = a[2]; tty[a[1]] = a[3]; next
+        }
+        { rows[++n] = $0; roots[n] = $4; ttys[n] = $5 }
+        END {
+            p = pid
+            while (p > 1 && !seen[p]++) {
+                for (i = 1; i <= n; i++) if (roots[i] == p) { print rows[i]; exit }
+                p = parent[p]
+            }
+            if (tty[pid] != "?" && tty[pid] != "??" && tty[pid] != "")
+                for (i = 1; i <= n; i++) if (ttys[i] == "/dev/" tty[pid]) { print rows[i]; exit }
+        }
+    ' "$work/ps" "$work/panes")
+    tmux_session='-'; window='-'; pane_id='-'; pane_directory='-'
+    if [[ -n $pane ]]; then
+        IFS=$'\t' read -r tmux_session window pane_id pane_pid pane_tty pane_directory <<< "$pane"
+    fi
+    if [[ $directory == '-' ]]; then
+        if command -v lsof >/dev/null; then
+            directory=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/ { print substr($0, 2); exit }') || directory=''
+        fi
+        directory=${directory:--}
+        [[ $directory != '-' ]] || directory=$pane_directory
+    fi
+    if [[ $directory == "$HOME" ]]; then directory='~'
+    elif [[ $directory == "$HOME/"* ]]; then directory="~/${directory#"$HOME/"}"; fi
+    # Keep terminal control characters in names/paths from affecting the output.
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$pid" "$tmux_session" "$window" "$pane_id" "$state" "$name" "${session_id:0:8}" "$directory" \
+        | LC_ALL=C tr '\000-\010\013-\037\177' '?' >> "$work/table"
+    count=$((count + 1))
+done < "$work/pids"
+
+if [[ $count -eq 0 ]]; then
+    printf 'No running Pi instances found.\n'
+else
+    column -t -s $'\t' < "$work/table"
+fi
+if [[ $missing -eq 1 ]]; then
+    printf '\nspi: run /reload in existing Pi instances to populate session metadata.\n' >&2
+fi
