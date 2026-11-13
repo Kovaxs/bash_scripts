@@ -4,16 +4,16 @@
 
 usage() {
     cat <<'EOF'
-ts - tmux sessionizer and jj workspaces for parallel pi agents
+ts - tmux sessionizer and jj workspaces
 
 USAGE
   ts                         Choose a directory with fzf (original behavior)
   ts <directory>             Open/switch to a tmux session for a directory
 
-  ts --session <workspace> [--from <revision>]
-  ts --window  <workspace> [--from <revision>]
-  ts --session --reattach <workspace>
-  ts --window  --reattach <workspace>
+  ts --session <workspace> [--from <revision>] [--] [<command> [args...]]
+  ts --window  <workspace> [--from <revision>] [--] [<command> [args...]]
+  ts --session --reattach <workspace> [--] [<command> [args...]]
+  ts --window  --reattach <workspace> [--] [<command> [args...]]
   ts --merge   <workspace> --into <local-bookmark>
   ts --push    <workspace> [--branch <bookmark>] [--remote <remote>]
   ts --close   <workspace>
@@ -28,18 +28,26 @@ WORKSPACE MODEL
   '/', '.', and ':' in the supplied name become '_'.
 
 COMMANDS
-  --session  Create a workspace from trunk() and start pi in a new tmux
+  --session  Create a workspace from trunk() and open a shell in a new tmux
              session. New windows inherit the active pane's directory.
-  --window   Create a workspace and start pi in a named window in the
+  --window   Create a workspace and open a shell in a named window in the
              current tmux session. Must be run from inside tmux.
   --reattach Reopen an existing workspace without creating or rebasing it.
              With --session, attach/switch to its named session, or create
              one if missing. With --window, select its named window in the
-             current session, or create one if missing. New targets start pi.
+             current session, or create one if missing.
              Cannot be combined with --from.
   --from     Base the new workspace on an existing local bookmark, remote
              bookmark, or revision instead of trunk(). If NAME has no local
              bookmark, NAME@origin is tried before failing.
+
+  Optional command:
+             New sessions/windows open your default shell unless a command
+             is supplied after the workspace and ts options. Use -- to
+             explicitly separate the command; all subsequent arguments are
+             passed through. Existing tmux targets are only selected: the
+             command is not run again. Normal tmux pane-exit behavior applies
+             when the command finishes. Use sh -lc for shell expressions.
 
   --merge    Rebase WORKSPACE@ onto the required local --into bookmark,
              then move that bookmark to the rebased workspace change.
@@ -59,7 +67,7 @@ COMMANDS
 RECIPES
   New local work in a session:
     ts --session feat-ui
-    # Work with pi, then inside the workspace:
+    # Work in the shell (or start your preferred tool), then:
     jj describe -m "feat: add UI"
     # From any directory in the repository:
     ts --merge feat-ui --into main
@@ -77,6 +85,12 @@ RECIPES
   Reopen an existing workspace (keep its current change):
     ts --session --reattach feat-ui
     ts --window --reattach feat-ui
+
+  Open a workspace with a tool or command instead of a shell:
+    ts --window --reattach feat-ui jjui
+    ts --session --reattach feat-ui -- btop
+    ts --window feat-ui --from main -- ls -la
+    ts --session feat-ui --from main -- pi
 
   Publish a workspace as a remote branch and open a PR:
     jj describe -m "feat: add UI"
@@ -181,9 +195,15 @@ create_workspace() {
     local workspace=''
     local from=''
     local reattach=false
+    local -a launch_command=()
 
     while [[ $# -gt 0 ]]; do
         case $1 in
+            --)
+                shift
+                launch_command=("$@")
+                break
+                ;;
             --reattach)
                 reattach=true
                 shift
@@ -197,7 +217,10 @@ create_workspace() {
                 usage_error "unknown option for $mode: $1"
                 ;;
             *)
-                [[ -z $workspace ]] || usage_error "$mode accepts exactly one workspace name"
+                if [[ -n $workspace ]]; then
+                    launch_command=("$@")
+                    break
+                fi
                 workspace=$1
                 shift
                 ;;
@@ -208,7 +231,6 @@ create_workspace() {
     if [[ $reattach == true && -n $from ]]; then
         usage_error "--reattach cannot be combined with --from"
     fi
-    command -v pi > /dev/null || die "required command not found: pi"
     command -v tmux > /dev/null || die "required command not found: tmux"
     require_repo
 
@@ -226,7 +248,7 @@ create_workspace() {
     if [[ $reattach == true ]]; then
         require_workspace "$workspace"
         if [[ $mode == --session ]]; then
-            open_session "$selected" "$workspace" pi
+            open_session "$selected" "$workspace" "${launch_command[@]}"
         else
             local window_id window_name
             while IFS=' ' read -r window_id window_name; do
@@ -235,7 +257,7 @@ create_workspace() {
                     return $?
                 fi
             done < <(tmux list-windows -F '#{window_id} #{window_name}')
-            tmux new-window -n "$workspace" -c "$selected" pi \; \
+            tmux new-window -n "$workspace" -c "$selected" "${launch_command[@]}" \; \
                 set-window-option automatic-rename off
         fi
         return $?
@@ -267,9 +289,9 @@ create_workspace() {
     fi
 
     if [[ $mode == --session ]]; then
-        open_session "$selected" "$workspace" pi
+        open_session "$selected" "$workspace" "${launch_command[@]}"
     else
-        tmux new-window -n "$workspace" -c "$selected" pi \; \
+        tmux new-window -n "$workspace" -c "$selected" "${launch_command[@]}" \; \
             set-window-option automatic-rename off
     fi
 }

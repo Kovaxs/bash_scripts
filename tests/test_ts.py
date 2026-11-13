@@ -17,7 +17,7 @@ JJ = shutil.which("jj")
 
 
 @unittest.skipUnless(JJ, "jj is required")
-class ReattachTests(unittest.TestCase):
+class WorkspaceLaunchTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -49,7 +49,6 @@ if args[0] == "has-session":
 if args[0] == "list-windows":
     print(os.environ["TEST_WINDOWS"])
 ''',
-            "pi": "#!/bin/sh\nexit 0\n",
             "pgrep": "#!/bin/sh\necho 123\n",
         }.items():
             path = fake_bin / name
@@ -68,11 +67,14 @@ if args[0] == "list-windows":
             text=True, capture_output=True, check=True,
         )
 
-    def ts(self, *args, **env):
-        result = subprocess.run(
+    def run_ts(self, *args, **env):
+        return subprocess.run(
             ["bash", str(TS), *args], cwd=self.repo,
             env={**self.env, **env}, text=True, capture_output=True,
         )
+
+    def ts(self, *args, **env):
+        result = self.run_ts(*args, **env)
         self.assertEqual((self.workspace / "work.txt").read_text(), "unfinished work\n")
         self.assertEqual(self.jj("workspace", "list").stdout, self.before)
         return result
@@ -94,13 +96,13 @@ if args[0] == "list-windows":
 
     def test_session_creates_missing_target(self):
         self.assert_ok(self.ts("--session", "--reattach", "feat-ui"))
-        self.assertIn(["new-session", "-ds", "feat-ui", "-c", str(self.workspace), "pi"], self.calls())
+        self.assertIn(["new-session", "-ds", "feat-ui", "-c", str(self.workspace)], self.calls())
 
     def test_session_starts_without_tmux_server(self):
         pgrep = Path(self.env["PATH"].split(":")[0]) / "pgrep"
         pgrep.write_text("#!/bin/sh\nexit 1\n")
         self.assert_ok(self.ts("--session", "--reattach", "feat-ui", TMUX=""))
-        self.assertEqual(self.calls(), [["new-session", "-s", "feat-ui", "-c", str(self.workspace), "pi"]])
+        self.assertEqual(self.calls(), [["new-session", "-s", "feat-ui", "-c", str(self.workspace)]])
 
     def test_window_selects_exact_name(self):
         self.assert_ok(self.ts("--window", "--reattach", "feat-ui", TEST_WINDOWS="@1 feat-ui-other\n@2 feat-ui"))
@@ -109,7 +111,81 @@ if args[0] == "list-windows":
 
     def test_window_creates_missing_target(self):
         self.assert_ok(self.ts("--window", "--reattach", "feat-ui"))
-        self.assertIn(["new-window", "-n", "feat-ui", "-c", str(self.workspace), "pi", ";", "set-window-option", "automatic-rename", "off"], self.calls())
+        self.assertIn(["new-window", "-n", "feat-ui", "-c", str(self.workspace), ";", "set-window-option", "automatic-rename", "off"], self.calls())
+
+    def test_session_accepts_tool_without_separator(self):
+        self.assert_ok(self.ts("--session", "--reattach", "feat-ui", "jjui"))
+        self.assertIn(["new-session", "-ds", "feat-ui", "-c", str(self.workspace), "jjui"], self.calls())
+
+    def test_window_passes_command_arguments_unchanged(self):
+        args = ["printf", "%s\\n", "two words", "*.py", "$HOME", "", "--from"]
+        self.assert_ok(self.ts("--window", "--reattach", "feat-ui", "--", *args))
+        self.assertIn(
+            ["new-window", "-n", "feat-ui", "-c", str(self.workspace), *args,
+             ";", "set-window-option", "automatic-rename", "off"], self.calls(),
+        )
+
+    def test_command_options_do_not_require_separator(self):
+        self.assert_ok(self.ts("--window", "--reattach", "feat-ui", "ls", "-la"))
+        call = next(call for call in self.calls() if call[0] == "new-window")
+        self.assertEqual(call[5:7], ["ls", "-la"])
+
+    def test_existing_session_does_not_restart_command(self):
+        self.assert_ok(self.ts("--session", "--reattach", "feat-ui", "btop", TEST_SESSION_EXISTS="1"))
+        self.assertEqual(self.calls(), [["has-session", "-t=feat-ui"], ["switch-client", "-t", "feat-ui"]])
+
+    def test_existing_window_does_not_restart_command(self):
+        self.assert_ok(self.ts("--window", "--reattach", "feat-ui", "top", TEST_WINDOWS="@2 feat-ui"))
+        self.assertEqual(self.calls(), [["list-windows", "-F", "#{window_id} #{window_name}"], ["select-window", "-t", "@2"]])
+
+    def test_fresh_server_accepts_command(self):
+        pgrep = Path(self.env["PATH"].split(":")[0]) / "pgrep"
+        pgrep.write_text("#!/bin/sh\nexit 1\n")
+        self.assert_ok(self.ts("--session", "--reattach", "feat-ui", "--", "ls", "-la", TMUX=""))
+        self.assertEqual(self.calls(), [["new-session", "-s", "feat-ui", "-c", str(self.workspace), "ls", "-la"]])
+
+    def test_empty_separator_opens_shell(self):
+        self.assert_ok(self.ts("--session", "--reattach", "feat-ui", "--"))
+        self.assertIn(["new-session", "-ds", "feat-ui", "-c", str(self.workspace)], self.calls())
+
+    def test_command_requires_workspace_before_separator(self):
+        result = self.ts("--window", "--reattach", "--", "ls")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires a workspace name", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_new_workspaces_default_to_shell(self):
+        self.jj("config", "set", "--repo", 'revset-aliases."trunk()"', "root()")
+        for mode in ("--session", "--window"):
+            with self.subTest(mode=mode):
+                name = f"new-{mode[2:]}"
+                directory = self.workspace.parent / name
+                self.assert_ok(self.run_ts(mode, name))
+                self.assertTrue(directory.is_dir())
+                if mode == "--session":
+                    expected = ["new-session", "-ds", name, "-c", str(directory)]
+                else:
+                    expected = ["new-window", "-n", name, "-c", str(directory),
+                                ";", "set-window-option", "automatic-rename", "off"]
+                self.assertIn(expected, self.calls())
+
+    def test_from_with_command_in_both_modes(self):
+        self.jj("bookmark", "create", "base", "-r", "@")
+        base = self.jj("log", "--no-graph", "-r", "base", "-T", "commit_id").stdout
+        for mode in ("--session", "--window"):
+            with self.subTest(mode=mode):
+                name = f"new-{mode[2:]}"
+                directory = self.workspace.parent / name
+                self.assert_ok(self.run_ts(mode, name, "--from", "base", "--", "ls", "-la"))
+                self.assertTrue(directory.is_dir())
+                parent = self.jj("log", "--no-graph", "-r", f"{name}@-", "-T", "commit_id").stdout
+                self.assertEqual(parent, base)
+                if mode == "--session":
+                    expected = ["new-session", "-ds", name, "-c", str(directory), "ls", "-la"]
+                else:
+                    expected = ["new-window", "-n", name, "-c", str(directory), "ls", "-la",
+                                ";", "set-window-option", "automatic-rename", "off"]
+                self.assertIn(expected, self.calls())
 
     def test_flag_can_follow_name(self):
         self.assert_ok(self.ts("--session", "feat-ui", "--reattach"))
