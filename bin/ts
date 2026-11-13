@@ -12,6 +12,8 @@ USAGE
 
   ts --session <workspace> [--from <revision>]
   ts --window  <workspace> [--from <revision>]
+  ts --session --reattach <workspace>
+  ts --window  --reattach <workspace>
   ts --merge   <workspace> --into <local-bookmark>
   ts --push    <workspace> [--branch <bookmark>] [--remote <remote>]
   ts --close   <workspace>
@@ -30,6 +32,11 @@ COMMANDS
              session. New windows inherit the active pane's directory.
   --window   Create a workspace and start pi in a named window in the
              current tmux session. Must be run from inside tmux.
+  --reattach Reopen an existing workspace without creating or rebasing it.
+             With --session, attach/switch to its named session, or create
+             one if missing. With --window, select its named window in the
+             current session, or create one if missing. New targets start pi.
+             Cannot be combined with --from.
   --from     Base the new workspace on an existing local bookmark, remote
              bookmark, or revision instead of trunk(). If NAME has no local
              bookmark, NAME@origin is tried before failing.
@@ -66,6 +73,10 @@ RECIPES
   Open an existing local or origin branch:
     ts --session feat-ui --from feat-ui
     ts --window feat-ui --from feat-ui@origin
+
+  Reopen an existing workspace (keep its current change):
+    ts --session --reattach feat-ui
+    ts --window --reattach feat-ui
 
   Publish a workspace as a remote branch and open a PR:
     jj describe -m "feat: add UI"
@@ -169,9 +180,14 @@ create_workspace() {
     shift
     local workspace=''
     local from=''
+    local reattach=false
 
     while [[ $# -gt 0 ]]; do
         case $1 in
+            --reattach)
+                reattach=true
+                shift
+                ;;
             --from)
                 [[ $# -ge 2 && -n $2 ]] || usage_error "--from requires a revision or bookmark"
                 from=$2
@@ -189,6 +205,9 @@ create_workspace() {
     done
 
     [[ -n $workspace ]] || usage_error "$mode requires a workspace name"
+    if [[ $reattach == true && -n $from ]]; then
+        usage_error "--reattach cannot be combined with --from"
+    fi
     command -v pi > /dev/null || die "required command not found: pi"
     command -v tmux > /dev/null || die "required command not found: tmux"
     require_repo
@@ -204,7 +223,24 @@ create_workspace() {
 
     local selected
     selected=$(workspace_dir "$workspace")
-    [[ ! -e $selected ]] || die "workspace path already exists: $selected"
+    if [[ $reattach == true ]]; then
+        require_workspace "$workspace"
+        if [[ $mode == --session ]]; then
+            open_session "$selected" "$workspace" pi
+        else
+            local window_id window_name
+            while IFS=' ' read -r window_id window_name; do
+                if [[ $window_name == "$workspace" ]]; then
+                    tmux select-window -t "$window_id"
+                    return $?
+                fi
+            done < <(tmux list-windows -F '#{window_id} #{window_name}')
+            tmux new-window -n "$workspace" -c "$selected" pi \; \
+                set-window-option automatic-rename off
+        fi
+        return $?
+    fi
+    [[ ! -e $selected ]] || die "workspace path already exists: $selected (use --reattach to reopen it)"
 
     if [[ $mode == --session ]] && tmux has-session -t="$workspace" 2> /dev/null; then
         die "tmux session already exists: $workspace"
